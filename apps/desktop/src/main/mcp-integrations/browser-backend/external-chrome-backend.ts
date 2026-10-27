@@ -831,6 +831,13 @@ export class ExternalChromeBackend implements BrowserBackend {
     // vendored `stopped: true` only means signals were sent, so it cannot skip
     // this check: a survivor would keep serving the old route under a new one.
     if ((await this.resolveLiveness()) !== 'gone') {
+      // A route switch must not be the one stop path that leaves the Windows
+      // orphan holding the CDP port: the same tree teardown `stop` uses is the
+      // only way out, and it aims solely at a process proven to be ours.
+      if (await this.terminateManagedBrowserIfOwned()) {
+        await this.disposeAuth();
+        return stopped;
+      }
       this.routeBlocked = true;
       return {
         ok: false,

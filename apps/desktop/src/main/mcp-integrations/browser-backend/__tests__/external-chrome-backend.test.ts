@@ -869,6 +869,32 @@ describe('ExternalChromeBackend proxy lifecycle', () => {
     });
   });
 
+  it('reclaims the CDP port on a route switch too, instead of only on an explicit stop', async () => {
+    // A route switch stops the current browser through its own path, which used
+    // to hard-block the moment liveness could not confirm the exit — so the very
+    // same Windows orphan that an explicit stop recovers from left the new route
+    // unstartable, and every later start blocked with it.
+    const { backend, created, isBrowserGone } = createHarness();
+    await backend.call({ action: 'start', proxyServer: 'http://proxy-a.test:8080' });
+    expect(created.map(({ route }) => route.mode)).toEqual(['proxied']);
+
+    // The vendored stop reports ok, but the browser is still alive.
+    isBrowserGone.mockResolvedValue(false);
+    terminateManagedChromeProcessTree.mockImplementation(async () => {
+      isBrowserGone.mockResolvedValue(true);
+      return { killedPids: [4242], portReleased: true };
+    });
+
+    const switched = await backend.call({ action: 'start' });
+
+    expect(terminateManagedChromeProcessTree).toHaveBeenCalledWith(expect.objectContaining({
+      cdpHttpUrl: 'http://127.0.0.1:18800',
+      userDataDir: '/managed/browser/Cindy/user-data',
+    }));
+    expect(switched.ok).toBe(true);
+    expect(created.map(({ route }) => route.mode)).toEqual(['proxied', 'direct']);
+  });
+
   it('installs the lifetime guard for credential-free proxied launches too', async () => {
     const auth = { start: vi.fn(async () => {}), dispose: vi.fn(async () => {}) };
     const routes: BrowserProxyRoute[] = [];

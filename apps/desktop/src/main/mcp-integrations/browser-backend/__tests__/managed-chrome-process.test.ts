@@ -89,7 +89,8 @@ describe('terminateManagedChromeProcessTree', () => {
   it('never signals a port owner the OS cannot prove is the managed browser', async () => {
     // Anything can hold a fixed port once Chrome exits, so a candidate whose
     // identity cannot be proven must be left running — and the port staying
-    // bound is what keeps the caller fail-closed.
+    // bound is what keeps the caller fail-closed. The zero budget skips the
+    // release wait: this port is never going to be freed.
     findPortOwnerPids.mockResolvedValue([4242]);
     const port = await heldPort();
 
@@ -98,6 +99,7 @@ describe('terminateManagedChromeProcessTree', () => {
       userDataDir,
       logger,
       isManagedProcess: async () => false,
+      portReleaseTimeoutMs: 0,
     });
 
     expect(killPortOwner).not.toHaveBeenCalled();
@@ -123,7 +125,8 @@ describe('terminateManagedChromeProcessTree', () => {
 
   it('reports the port as still held when the kill could not free it', async () => {
     // The kill was issued but the survivor kept the port: the caller must not
-    // read the teardown as a clean exit.
+    // read the teardown as a clean exit. The zero budget skips the wait so the
+    // suite does not sit out the production timeout on a port that never frees.
     findPortOwnerPids.mockResolvedValue([4242]);
     const port = await heldPort();
 
@@ -132,10 +135,40 @@ describe('terminateManagedChromeProcessTree', () => {
       userDataDir,
       logger,
       isManagedProcess: async () => true,
+      portReleaseTimeoutMs: 0,
     });
 
     expect(killPortOwner).toHaveBeenCalledTimes(1);
     expect(result.killedPids).toEqual([4242]);
     expect(result.portReleased).toBe(false);
+  });
+
+  it('waits for the port to be released instead of probing once', async () => {
+    // A delivered signal is not an exit: the process can drop its listening
+    // socket a moment after `kill` returns. Probing once right after the signal
+    // would call that a failure, and the caller would keep the route
+    // hard-blocked over a browser that did exit — the user would have to stop a
+    // second time. The listener drops its socket as soon as a probe finds it,
+    // so the first probe always reports "still listening" and only a second
+    // look can see the release. The 10ms poll interval keeps the wait real but
+    // far below the suite's no-long-wait budget.
+    findPortOwnerPids.mockResolvedValue([4242]);
+    const server = createServer();
+    server.on('connection', () => server.close());
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+    servers.push(server);
+    const port = (server.address() as AddressInfo).port;
+
+    const result = await terminateManagedChromeProcessTree({
+      cdpHttpUrl: `http://127.0.0.1:${port}`,
+      userDataDir,
+      logger,
+      isManagedProcess: async () => true,
+      portReleaseTimeoutMs: 1_000,
+      portReleasePollIntervalMs: 10,
+    });
+
+    expect(result.killedPids).toEqual([4242]);
+    expect(result.portReleased).toBe(true);
   });
 });

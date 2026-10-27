@@ -146,6 +146,41 @@ export async function isCdpPortListening(cdpHttpUrl: string): Promise<boolean> {
 }
 
 /**
+ * How long a signalled browser may take to drop its listening socket, and how
+ * often to re-check while it does.
+ *
+ * `kill` returning is not the process exiting: the kernel can hand the socket
+ * back a moment later, so probing once right after the signal would call a
+ * successful teardown a failure — and the caller would keep the route
+ * hard-blocked over a browser that did exit. The budget has to be long enough
+ * for a dying Chromium to unwind, and short enough that a genuinely stuck port
+ * still fails fast (the caller stays fail-closed either way).
+ */
+const PORT_RELEASE_TIMEOUT_MS = 3_000;
+const PORT_RELEASE_POLL_INTERVAL_MS = 100;
+
+/**
+ * Wait, within a bounded budget, for the CDP port to actually be free.
+ *
+ * Returns as soon as a probe finds nothing listening; when the budget runs out
+ * with the port still held, returns false so the caller keeps its hard block
+ * rather than optimistically declaring the teardown a success.
+ */
+async function waitForCdpPortReleased(
+  cdpHttpUrl: string,
+  opts?: { timeoutMs?: number; pollIntervalMs?: number },
+): Promise<boolean> {
+  const timeoutMs = opts?.timeoutMs ?? PORT_RELEASE_TIMEOUT_MS;
+  const pollIntervalMs = opts?.pollIntervalMs ?? PORT_RELEASE_POLL_INTERVAL_MS;
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (!(await isCdpPortListening(cdpHttpUrl))) return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise<void>((resolve) => setTimeout(resolve, pollIntervalMs));
+  }
+}
+
+/**
  * Terminate the managed browser's process tree at the OS level.
  *
  * The graceful CDP close cannot always finish the job. On Windows the vendored
@@ -162,8 +197,10 @@ export async function isCdpPortListening(cdpHttpUrl: string): Promise<boolean> {
  * proven is left alone, which keeps the caller fail-closed.
  *
  * Issuing the kill is not an exit: `taskkill` can fail on permissions or lose
- * a race. The caller must re-verify independently; `portReleased` reports what
- * the OS could confirm right after the signals were sent.
+ * a race, and even a delivered signal leaves the process (and the socket it
+ * owns) alive for a moment. The caller must re-verify independently;
+ * `portReleased` reports what the OS could confirm within a bounded wait after
+ * the signals were sent.
  */
 export async function terminateManagedChromeProcessTree(params: {
   cdpHttpUrl: string;
@@ -174,6 +211,13 @@ export async function terminateManagedChromeProcessTree(params: {
    * command line and requires Cindy's own profile and CDP port.
    */
   isManagedProcess?: (pid: number) => Promise<boolean>;
+  /**
+   * Bounded wait for the OS to actually free the port after the signals.
+   * Test seam; production waits long enough for a dying process to drop its
+   * listening socket.
+   */
+  portReleaseTimeoutMs?: number;
+  portReleasePollIntervalMs?: number;
 }): Promise<ManagedChromeTermination> {
   const { cdpHttpUrl, userDataDir, logger } = params;
   let cdpPort: number;
@@ -200,5 +244,9 @@ export async function terminateManagedChromeProcessTree(params: {
       logger.warn('terminated the managed browser process tree', { pid, cdpPort });
     }
   }
-  return { killedPids, portReleased: !(await isCdpPortListening(cdpHttpUrl)) };
+  const portReleased = await waitForCdpPortReleased(cdpHttpUrl, {
+    timeoutMs: params.portReleaseTimeoutMs,
+    pollIntervalMs: params.portReleasePollIntervalMs,
+  });
+  return { killedPids, portReleased };
 }
