@@ -9,7 +9,6 @@ import { resetBrowserProxyDnsVerdictCache } from '@cindy/browser-control-runtime
 import {
   BrowserProxyAuthCoordinator,
   closeAdoptedManagedBrowser,
-  commandLineHasExactArgument,
 } from '../proxy-auth.js';
 
 interface CdpCommand {
@@ -158,33 +157,6 @@ async function createFakeCdp(options: {
 // The request gate verifies DNS answers, so tests must supply a resolver:
 // the `.example` hosts they use do not resolve. Public answer by default.
 const publicLookup = (async () => [{ address: '93.184.216.34', family: 4 }]) as never;
-
-describe('commandLineHasExactArgument', () => {
-  const dir = '/Users/me/Library/Application Support/Cindy/browser/Cindy';
-
-  it('rejects a value the expected one is merely a prefix of', () => {
-    // The reason this cannot be `includes`: the result feeds a process kill, so
-    // matching `<dir>-backup` would terminate an unrelated browser and its tree.
-    expect(commandLineHasExactArgument(
-      `chrome --user-data-dir=${dir}-backup --remote-debugging-port=18800`,
-      `--user-data-dir=${dir}`,
-    )).toBe(false);
-    expect(commandLineHasExactArgument(
-      'chrome --remote-debugging-port=188000',
-      '--remote-debugging-port=18800',
-    )).toBe(false);
-  });
-
-  it('accepts the argument when it stands as its own token', () => {
-    for (const line of [
-      `chrome --user-data-dir=${dir} --remote-debugging-port=18800`,
-      `chrome "--user-data-dir=${dir}" --headless`,
-      `--user-data-dir=${dir}`,
-    ]) {
-      expect(commandLineHasExactArgument(line, `--user-data-dir=${dir}`), line).toBe(true);
-    }
-  });
-});
 
 describe('BrowserProxyAuthCoordinator', () => {
   beforeEach(() => {

@@ -1,19 +1,20 @@
-import { execFile } from 'node:child_process';
-import { createConnection } from 'node:net';
-import { promisify } from 'node:util';
-
 import WebSocket from 'ws';
-
-import { findPortOwnerPids, killPortOwner } from '../../cindy-brain/portReclaim.js';
 
 import {
   isBrowserProxyRequestUrlAllowedAsync,
   managedProfilePidOwnsCdpPort,
-  pidIsManagedChromeForProfile,
   readManagedProfileOwnerPid,
   type BrowserProxyRoute,
   type LookupFn,
 } from '@cindy/browser-control-runtime';
+
+import {
+  commandLineHasExactArgument,
+  isCdpPortListening,
+  isManagedChromeProcess,
+  terminateManagedChromeProcessTree,
+  type ManagedChromeProcessLogger,
+} from './managed-chrome-process.js';
 
 type CdpResponse = {
   id?: number;
@@ -29,8 +30,6 @@ type Pending = {
   reject: (error: Error) => void;
   timer: ReturnType<typeof setTimeout>;
 };
-
-const execFileAsync = promisify(execFile);
 
 const COMMAND_TIMEOUT_MS = 10_000;
 
@@ -154,111 +153,6 @@ async function confirmNoManagedChromeProcess(cdpHttpUrl: string): Promise<boolea
 }
 
 /**
- * Whether a command line carries this exact argument, respecting token
- * boundaries.
- *
- * A substring test is not sufficient: `--user-data-dir=/p/Cindy` is a prefix of
- * `--user-data-dir=/p/Cindy-backup`, so `includes` would accept an unrelated
- * browser and hand it to a process kill. The argument must be delimited by
- * whitespace or quotes on both sides (or sit at a string edge).
- */
-export function commandLineHasExactArgument(commandLine: string, argument: string): boolean {
-  let offset = commandLine.indexOf(argument);
-  while (offset >= 0) {
-    const before = offset === 0 ? '' : commandLine[offset - 1];
-    const after = commandLine[offset + argument.length] ?? '';
-    if ((!before || /[\s"']/.test(before)) && (!after || /[\s"']/.test(after))) return true;
-    offset = commandLine.indexOf(argument, offset + 1);
-  }
-  return false;
-}
-
-/**
- * Windows command-line identity for a PID.
- *
- * The vendored `readManagedProcessCommandLine` only implements Linux (/proc)
- * and macOS (ps), returning null on win32 — so the shared identity verifier
- * always answers "not ours" there, which would silently disable the very
- * teardown this platform needs. Query Win32_Process for the command line so
- * the same profile/port proof can be applied.
- *
- * Returns null on any failure, so callers treat an unknown identity as "do not
- * signal" rather than assuming ownership.
- */
-async function readWindowsProcessCommandLine(pid: number): Promise<string | null> {
-  try {
-    const powershell = `${process.env.SystemRoot ?? 'C:\\Windows'}`
-      + '\\System32\\WindowsPowerShell\\v1.0\\powershell.exe';
-    const { stdout } = await execFileAsync(
-      powershell,
-      [
-        '-NoProfile',
-        '-NonInteractive',
-        '-Command',
-        `$p = Get-CimInstance Win32_Process -Filter "ProcessId=${pid}" -ErrorAction Stop; `
-          + 'if ($p) { [string]$p.CommandLine }',
-      ],
-      { encoding: 'utf8', timeout: 5_000, windowsHide: true, maxBuffer: 64 * 1024 },
-    );
-    const text = stdout.trim();
-    return text === '' ? null : text;
-  } catch {
-    return null;
-  }
-}
-
-/** Whether a PID is a Chrome launched for exactly this profile and CDP port. */
-async function isManagedChromeProcess(params: {
-  pid: number;
-  cdpPort: number;
-  userDataDir: string;
-}): Promise<boolean> {
-  if (process.platform !== 'win32') {
-    return pidIsManagedChromeForProfile(params);
-  }
-  const commandLine = await readWindowsProcessCommandLine(params.pid);
-  if (!commandLine) return false;
-  // Same two proofs the POSIX path requires: our profile AND our debug port.
-  // Exact-argument matching, not substring: `--user-data-dir=<dir>` is a prefix
-  // of `--user-data-dir=<dir>-backup`, and this result feeds `taskkill /T /F`.
-  return commandLineHasExactArgument(commandLine, `--user-data-dir=${params.userDataDir}`)
-    && commandLineHasExactArgument(commandLine, `--remote-debugging-port=${params.cdpPort}`);
-}
-
-/**
- * Whether anything still holds the CDP port.
- *
- * Deliberately a bare TCP connect, not an HTTP request: accepting a connection
- * is handled by the OS/socket layer, so a Chrome stalled on its main thread
- * still completes it while failing to answer `/json/version`. That difference
- * is the whole point — it separates "process gone" from "process busy".
- */
-async function isCdpPortListening(cdpHttpUrl: string): Promise<boolean> {
-  let target: URL;
-  try {
-    target = new URL(cdpHttpUrl);
-  } catch {
-    return false;
-  }
-  const port = Number(target.port || 80);
-  const host = target.hostname.replace(/^\[|\]$/g, '');
-  return await new Promise<boolean>((resolve) => {
-    let settled = false;
-    const finish = (listening: boolean) => {
-      if (settled) return;
-      settled = true;
-      try { socket.destroy(); } catch { /* best effort */ }
-      resolve(listening);
-    };
-    const socket = createConnection({ port, host });
-    socket.setTimeout(1_000);
-    socket.once('connect', () => finish(true));
-    socket.once('timeout', () => finish(true)); // reachable but unresponsive
-    socket.once('error', () => finish(false));
-  });
-}
-
-/**
  * Whether the CDP endpoint is verifiably gone, not merely slow to answer.
  * Fails closed: if the window cannot be established before the deadline, the
  * caller must treat the browser as still running.
@@ -291,6 +185,14 @@ async function confirmCdpGone(cdpHttpUrl: string): Promise<boolean> {
  * ownership state. A route transition must not re-adopt such a process and
  * claim the new route, so the host explicitly closes it and verifies the CDP
  * listener is gone before relaunching.
+ *
+ * When the graceful close cannot finish the job — the endpoint never answered,
+ * or it answered and the browser is still holding the port — the teardown
+ * escalates to the OS: the managed browser's process tree is killed, but only
+ * after its identity was proven from the process itself. Without that
+ * escalation a browser whose parent was killed (Windows orphans Chromium's
+ * children) keeps the CDP port bound forever, and every later route decision
+ * is stuck on "could not be verified".
  */
 /**
  * Non-destructive liveness probe: whether the managed browser's CDP endpoint
@@ -342,9 +244,36 @@ export async function readCdpBrowserCommandLine(cdpHttpUrl: string): Promise<str
   return commandLine;
 }
 
+/**
+ * Kill the managed browser's process tree and report whether that freed the
+ * CDP port.
+ *
+ * The kill is only ever aimed at a process proven to be the managed browser
+ * (exact `--user-data-dir` and `--remote-debugging-port` arguments read from
+ * the OS), so an unrelated browser is never signalled. A candidate that cannot
+ * be proven is left running and the port stays bound, which keeps the caller
+ * fail-closed.
+ */
+async function terminateManagedBrowserTree(
+  cdpHttpUrl: string,
+  expectedUserDataDir: string,
+  logger: ManagedChromeProcessLogger,
+): Promise<boolean> {
+  const termination = await terminateManagedChromeProcessTree({
+    cdpHttpUrl,
+    userDataDir: expectedUserDataDir,
+    logger,
+  });
+  // Issuing the kill is not an exit: `taskkill` can fail on permissions or
+  // lose a race, and a survivor may take the port right back. Only the
+  // independent probe may declare the browser gone.
+  return termination.portReleased && await confirmCdpGone(cdpHttpUrl);
+}
+
 export async function closeAdoptedManagedBrowser(
   cdpHttpUrl: string,
   expectedUserDataDir: string,
+  logger: ManagedChromeProcessLogger = { warn: () => {} },
 ): Promise<boolean> {
   let wsUrl: string;
   try {
@@ -355,7 +284,8 @@ export async function closeAdoptedManagedBrowser(
     // would unblock the route and mis-report a surviving process (possibly on
     // an unknown proxy route) as direct. Require the endpoint to stay
     // unreachable across the full quiescence window before claiming success.
-    return await confirmCdpGone(cdpHttpUrl);
+    if (await confirmCdpGone(cdpHttpUrl)) return true;
+    return await terminateManagedBrowserTree(cdpHttpUrl, expectedUserDataDir, logger);
   }
 
   const socket = new WebSocket(wsUrl, { handshakeTimeout: COMMAND_TIMEOUT_MS });
@@ -410,9 +340,17 @@ export async function closeAdoptedManagedBrowser(
   if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
     try { socket.close(); } catch { /* best effort */ }
   }
-  if (!requested) return false;
+  if (!requested) {
+    // The browser refused the graceful close (or never confirmed it). Escalate
+    // to the OS before reporting failure, so a survivor that cannot be closed
+    // over CDP does not pin the CDP port forever.
+    return await terminateManagedBrowserTree(cdpHttpUrl, expectedUserDataDir, logger);
+  }
 
-  return await confirmCdpGone(cdpHttpUrl);
+  if (await confirmCdpGone(cdpHttpUrl)) return true;
+  // The close was requested but the browser still holds the port — a survivor
+  // that outlived its parent, or a process that ignored the close command.
+  return await terminateManagedBrowserTree(cdpHttpUrl, expectedUserDataDir, logger);
 }
 
 /**
@@ -831,7 +769,7 @@ export class BrowserProxyAuthCoordinator {
     if (!cdpHttpUrl || !expectedUserDataDir) return;
     let closed = false;
     try {
-      closed = await closeAdoptedManagedBrowser(cdpHttpUrl, expectedUserDataDir);
+      closed = await closeAdoptedManagedBrowser(cdpHttpUrl, expectedUserDataDir, this.logger);
     } catch {
       closed = false;
     }
@@ -883,28 +821,17 @@ export class BrowserProxyAuthCoordinator {
       //
       // killPortOwner refuses protected/self PIDs and uses `taskkill /T`, which
       // matters because Chrome's renderer children would otherwise be orphaned.
-      const reclaimLogger = {
-        info: (message: string, meta?: Record<string, unknown>) => this.logger.warn(message, meta),
-        warn: (message: string, meta?: Record<string, unknown>) => this.logger.warn(message, meta),
-      };
-      for (const owner of await findPortOwnerPids(cdpPort)) {
-        if (!(await isManagedChromeProcess({
-          pid: owner,
-          cdpPort,
-          userDataDir: managedUserDataDir,
-        }))) {
-          this.logger.warn('skipping CDP port owner: not the managed browser', { pid: owner });
-          continue;
-        }
-        await killPortOwner(owner, reclaimLogger);
-      }
+      //
       // Issuing the kill is not exit. taskkill can fail on permissions, lose a
-      // race, or return an error, and killPortOwner reports that as false —
-      // which the loop above deliberately does not act on per-PID, since a
-      // partial failure still leaves the port to check. Verify centrally
-      // instead: if the port is still held, nothing was actually torn down and
-      // the caller must keep treating this route as untrusted.
-      if (await isCdpPortListening(this.cdpHttpUrl ?? 'http://127.0.0.1:18800')) {
+      // race, or return an error — so the port is checked centrally: if it is
+      // still held, nothing was actually torn down and the caller must keep
+      // treating this route as untrusted.
+      const termination = await terminateManagedChromeProcessTree({
+        cdpHttpUrl: this.cdpHttpUrl ?? 'http://127.0.0.1:18800',
+        userDataDir: managedUserDataDir,
+        logger: this.logger,
+      });
+      if (!termination.portReleased) {
         this.logger.warn(
           'managed browser survived proxy-guard teardown; route stays blocked until a verified stop',
         );

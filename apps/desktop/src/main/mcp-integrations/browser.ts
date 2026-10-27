@@ -822,10 +822,11 @@ export async function openBrowserForLogin(): Promise<void> {
  * which swallows errors.
  *
  * NOTE (Windows): the managed runtime stop sends SIGTERM→SIGKILL to the launched Chrome
- * process. Chromium's child renderer/GPU processes normally exit with their
- * parent, but full process-tree teardown on win32 is not yet verified — if
- * orphans are observed, add a host-side `taskkill /F /T /PID <pid>` fallback here
- * (requires surfacing the pid; the vendored runtime does not expose it today).
+ * process, and `TerminateProcess` reaches only that one handle — Chromium's children can
+ * survive as orphans and keep the CDP port bound. The external backend's stop path
+ * therefore escalates to a host-side `taskkill /T /F` on the process holding the port, but
+ * only after the OS command line proves it is the managed browser
+ * (`browser-backend/managed-chrome-process.ts`).
  * NOTE: updater force-quit (updateService.ts) bypasses `before-quit`, so this may
  * not run on the auto-update relaunch path; stale-lock recovery covers that case.
  */

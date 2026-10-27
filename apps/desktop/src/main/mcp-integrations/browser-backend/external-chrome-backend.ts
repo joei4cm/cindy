@@ -23,6 +23,10 @@ import {
   isManagedBrowserGone,
 } from './proxy-auth.js';
 import type { ExternalLinkHandoff } from './external-link-handoff.js';
+import {
+  terminateManagedChromeProcessTree,
+  type ManagedChromeProcessLogger,
+} from './managed-chrome-process.js';
 
 interface BackendLogger {
   warn(message: string, ...args: unknown[]): void;
@@ -58,6 +62,14 @@ export interface ExternalChromeBackendOptions {
    * be creating a tab right now, so agent tabs are never taken away.
    */
   createLinkHandoff?: (isAgentOpeningTab: () => boolean) => Pick<ExternalLinkHandoff, 'ensure' | 'dispose'>;
+  /**
+   * Test seam for the OS-level teardown of the managed browser's process tree.
+   * Returns whether the CDP port was freed.
+   */
+  terminateManagedBrowser?: (
+    cdpHttpUrl: string,
+    expectedUserDataDir: string,
+  ) => Promise<boolean>;
 }
 
 /** An agent tab's creation event can trail the end of its `open` call slightly. */
@@ -668,6 +680,17 @@ export class ExternalChromeBackend implements BrowserBackend {
     if (!stoppedSafely && !this.route) {
       stoppedSafely = await this.closeAdoptedBrowserIfManaged();
     }
+    // Last resort: the browser is still there and no CDP-level close could
+    // finish it. On Windows the vendored stop escalates to a `TerminateProcess`
+    // on the one handle it launched, so Chromium's children survive as orphans
+    // and one of them keeps the CDP port bound — the route can then never be
+    // verified stopped and every later request (including `start`) is blocked
+    // for the rest of the process lifetime. The OS tree kill is the only way
+    // out, and it only ever aims at a process proven to be the managed
+    // browser.
+    if (!stoppedSafely) {
+      stoppedSafely = await this.terminateManagedBrowserIfOwned();
+    }
     if (stoppedSafely) {
       await this.disposeAuth();
       this.resetStoppedRuntime();
@@ -738,6 +761,55 @@ export class ExternalChromeBackend implements BrowserBackend {
       this.logger.warn('managed browser adopted close failed', redactBrowserProxyText(err));
       return false;
     }
+  }
+
+  /**
+   * Kill the managed browser's process tree at the OS level, then re-verify.
+   *
+   * The CDP-level remedies can all fail while the browser is still alive: on
+   * Windows the vendored stop terminates only the process handle it launched,
+   * so Chromium's children survive as orphans and keep the CDP port bound. The
+   * route can then never be verified stopped, and the backend hard-blocks
+   * every later request — including `start` — for good.
+   *
+   * The tree kill is safe because the OS command line must carry exactly our
+   * `--user-data-dir` and `--remote-debugging-port` before anything is
+   * signalled; a candidate that cannot be proven is left running, which keeps
+   * the caller fail-closed.
+   */
+  private async terminateManagedBrowserIfOwned(): Promise<boolean> {
+    const expectedUserDataDir = this.resolveManagedUserDataDir();
+    if (!expectedUserDataDir) return false;
+    const cdpHttpUrl = this.resolveCdpHttpUrl();
+    try {
+      const terminate = this.options.terminateManagedBrowser
+        ?? ((url: string, userDataDir: string) => this.terminateManagedBrowserTree(url, userDataDir));
+      const released = await terminate(cdpHttpUrl, expectedUserDataDir);
+      if (!released) {
+        this.logger.warn('managed browser survived the forced process-tree teardown');
+        return false;
+      }
+    } catch (err) {
+      this.logger.warn('managed browser forced process-tree teardown threw', redactBrowserProxyText(err));
+      return false;
+    }
+    // The kill was issued; only an independent probe may call the browser gone.
+    return (await this.resolveLiveness()) === 'gone';
+  }
+
+  private async terminateManagedBrowserTree(
+    cdpHttpUrl: string,
+    userDataDir: string,
+  ): Promise<boolean> {
+    const logger: ManagedChromeProcessLogger = {
+      warn: (message, meta) => this.logger.warn(message, meta),
+    };
+    const termination = await terminateManagedChromeProcessTree({
+      cdpHttpUrl,
+      userDataDir,
+      logger,
+    });
+    return termination.portReleased;
   }
 
   private async stopCurrentRuntime(): Promise<BackendResult> {

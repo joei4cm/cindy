@@ -3,7 +3,7 @@
 // launch state rather than a per-request option, and dispose stops the browser
 // through the same logs-and-swallows quit contract.
 
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type {
   BrowserControlRequest,
@@ -11,7 +11,30 @@ import type {
   BrowserProxyRoute,
 } from '@cindy/browser-control-runtime';
 
+const { terminateManagedChromeProcessTree } = vi.hoisted(() => ({
+  terminateManagedChromeProcessTree: vi.fn<(params: {
+    cdpHttpUrl: string;
+    userDataDir: string;
+    logger: { warn(message: string, meta?: Record<string, unknown>): void };
+  }) => Promise<{ killedPids: number[]; portReleased: boolean }>>(),
+}));
+
+// The OS-level teardown reaches for the real process table, so it is stubbed
+// here: the tests below drive it explicitly, and the rest of the file must not
+// depend on what happens to run on the test machine.
+vi.mock('../managed-chrome-process.js', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  terminateManagedChromeProcessTree,
+}));
+
 import { ExternalChromeBackend } from '../external-chrome-backend.js';
+
+afterEach(() => {
+  // The OS-level teardown is stubbed for the whole file; every test that
+  // cares about it drives the stub explicitly.
+  terminateManagedChromeProcessTree.mockReset();
+  terminateManagedChromeProcessTree.mockResolvedValue({ killedPids: [], portReleased: false });
+});
 
 function fakeLogger() {
   return { warn: vi.fn() };
@@ -769,6 +792,77 @@ describe('ExternalChromeBackend proxy lifecycle', () => {
     });
 
     await expect(backend.call({ action: 'stop' })).resolves.toMatchObject({ ok: false });
+    await expect(backend.call({ action: 'tabs' })).resolves.toMatchObject({
+      ok: false,
+      errorCode: 'BROWSER_RUNTIME_UNAVAILABLE',
+    });
+  });
+
+  it('reclaims the CDP port with an OS-level tree kill when the stop cannot be verified', async () => {
+    // The Windows survivor: the vendored stop signals only the process handle
+    // it launched, so Chromium's children survive as orphans and one of them
+    // keeps the CDP port bound. The stop then cannot be verified, and the
+    // backend used to hard-block every later call — including `start` — for
+    // the rest of the process lifetime.
+    const runtime = {
+      call: vi.fn(async (req: BrowserControlRequest): Promise<BrowserControlResult> => {
+        if (req.action === 'stop') {
+          return { ok: true, action: req.action, status: 200, data: { stopped: false } };
+        }
+        // Busy browser: readiness reports NOT running though it is alive.
+        return { ok: true, action: req.action, status: 200, data: { running: false } };
+      }),
+    };
+    let portHeld = true;
+    terminateManagedChromeProcessTree.mockImplementation(async () => {
+      portHeld = false;
+      return { killedPids: [4242], portReleased: true };
+    });
+    const backend = new ExternalChromeBackend(fakeRuntime(), fakeLogger(), {
+      createRuntime: () => runtime,
+      isBrowserGone: vi.fn(async () => !portHeld),
+      closeAdoptedBrowser: vi.fn(async () => false),
+      managedUserDataDir: '/managed/browser/Cindy/user-data',
+    });
+
+    const stopped = await backend.call({ action: 'stop' });
+
+    // The tree kill must aim at the managed profile and the managed port.
+    expect(terminateManagedChromeProcessTree).toHaveBeenCalledWith(expect.objectContaining({
+      cdpHttpUrl: 'http://127.0.0.1:18800',
+      userDataDir: '/managed/browser/Cindy/user-data',
+    }));
+    expect(stopped.ok).toBe(true);
+    expect(stopped.data).toMatchObject({ stopped: true });
+    // The hard block must be gone: the browser has to be startable again.
+    await expect(backend.call({ action: 'start' })).resolves.toMatchObject({ ok: true });
+  });
+
+  it('keeps the route blocked when the forced teardown cannot free the CDP port', async () => {
+    const runtime = {
+      call: vi.fn(async (req: BrowserControlRequest): Promise<BrowserControlResult> => {
+        if (req.action === 'stop') {
+          return { ok: true, action: req.action, status: 200, data: { stopped: false } };
+        }
+        return { ok: true, action: req.action, status: 200, data: { running: false } };
+      }),
+    };
+    terminateManagedChromeProcessTree.mockImplementation(async () => (
+      { killedPids: [], portReleased: false }
+    ));
+    const backend = new ExternalChromeBackend(fakeRuntime(), fakeLogger(), {
+      createRuntime: () => runtime,
+      isBrowserGone: vi.fn(async () => false),
+      closeAdoptedBrowser: vi.fn(async () => false),
+      managedUserDataDir: '/managed/browser/Cindy/user-data',
+    });
+
+    const stopped = await backend.call({ action: 'stop' });
+
+    expect(terminateManagedChromeProcessTree).toHaveBeenCalledTimes(1);
+    // A survivor that still holds the port must not be reported as stopped:
+    // the route stays blocked until a verified stop.
+    expect(stopped).toMatchObject({ ok: false, errorCode: 'BROWSER_RUNTIME_ACTION_FAILED' });
     await expect(backend.call({ action: 'tabs' })).resolves.toMatchObject({
       ok: false,
       errorCode: 'BROWSER_RUNTIME_UNAVAILABLE',
