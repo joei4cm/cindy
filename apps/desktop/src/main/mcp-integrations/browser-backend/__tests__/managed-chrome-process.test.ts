@@ -21,7 +21,9 @@ vi.mock('../../../cindy-brain/portReclaim.js', () => ({
 
 import {
   commandLineHasExactArgument,
+  readWindowsProcessCommandLine,
   terminateManagedChromeProcessTree,
+  type ManagedChromeCommandRunner,
 } from '../managed-chrome-process.js';
 
 const servers: Server[] = [];
@@ -79,6 +81,52 @@ describe('commandLineHasExactArgument', () => {
     ]) {
       expect(commandLineHasExactArgument(line, `--user-data-dir=${dir}`), line).toBe(true);
     }
+  });
+
+  it('accepts a Unicode profile path as its own token', () => {
+    // Windows profiles may live under non-ASCII paths; the exact-argument
+    // proof must still recognise them so the tree kill is not skipped.
+    const unicodeDir = 'C:\\用户\\Cindy 数据\\user-data';
+    expect(commandLineHasExactArgument(
+      `chrome --user-data-dir=${unicodeDir} --remote-debugging-port=18800`,
+      `--user-data-dir=${unicodeDir}`,
+    )).toBe(true);
+    expect(commandLineHasExactArgument(
+      `chrome --user-data-dir=${unicodeDir}-backup --remote-debugging-port=18800`,
+      `--user-data-dir=${unicodeDir}`,
+    )).toBe(false);
+  });
+});
+
+describe('readWindowsProcessCommandLine', () => {
+  it('pins the PowerShell console to UTF-8 so Unicode profile paths survive identity matching', async () => {
+    // OutputEncoding is the encoding the console WRITES with. Without the pin,
+    // a non-UTF-8 system code page mojibakes the profile path, the exact
+    // identity comparison fails, and taskkill /T /F never runs for that user.
+    const unicodeDir = 'C:\\用户\\Cindy 数据\\user-data';
+    const runCommand = vi.fn<ManagedChromeCommandRunner>(async () => ({
+      stdout: `chrome.exe --user-data-dir=${unicodeDir} --remote-debugging-port=18800\r\n`,
+    }));
+    const commandLine = await readWindowsProcessCommandLine(4321, runCommand);
+    expect(commandLine).toContain(`--user-data-dir=${unicodeDir}`);
+    const script = runCommand.mock.calls[0]?.[1].join(' ') ?? '';
+    expect(script).toContain('[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)');
+    // The full proof this decode feeds: both exact arguments still match.
+    expect(commandLineHasExactArgument(
+      commandLine!,
+      `--user-data-dir=${unicodeDir}`,
+    )).toBe(true);
+    expect(commandLineHasExactArgument(
+      commandLine!,
+      '--remote-debugging-port=18800',
+    )).toBe(true);
+  });
+
+  it('returns null when the query fails so callers never signal an unproven pid', async () => {
+    const runCommand = vi.fn<ManagedChromeCommandRunner>(async () => {
+      throw new Error('query failed');
+    });
+    await expect(readWindowsProcessCommandLine(4321, runCommand)).resolves.toBeNull();
   });
 });
 

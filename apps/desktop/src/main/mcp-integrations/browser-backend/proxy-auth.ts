@@ -16,6 +16,11 @@ import {
   type ManagedChromeProcessLogger,
 } from './managed-chrome-process.js';
 
+// Historical home of the exact-argument proof: it moved to
+// managed-chrome-process.ts, but callers (external-link-handoff) import it
+// from here, so keep the path alive as a re-export.
+export { commandLineHasExactArgument };
+
 type CdpResponse = {
   id?: number;
   result?: unknown;

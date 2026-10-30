@@ -895,6 +895,121 @@ describe('ExternalChromeBackend proxy lifecycle', () => {
     expect(created.map(({ route }) => route.mode)).toEqual(['proxied', 'direct']);
   });
 
+  it('reclaims the CDP port when the vendored stop itself fails, instead of hard-blocking', async () => {
+    // The stop dispatch can fail in-process while Chrome keeps owning the port.
+    // That early `!ok` return used to skip the tree teardown entirely, so the
+    // same Windows survivor hard-blocked every later request including start.
+    const { backend, created, isBrowserGone } = createHarness();
+    await backend.call({ action: 'start', proxyServer: 'http://proxy-a.test:8080' });
+    expect(created.map(({ route }) => route.mode)).toEqual(['proxied']);
+
+    const runtime = created[0].runtime;
+    runtime.call.mockImplementation(async (req: BrowserControlRequest): Promise<BrowserControlResult> => {
+      if (req.action === 'stop') {
+        return {
+          ok: false,
+          action: req.action,
+          status: 500,
+          errorCode: 'BROWSER_RUNTIME_ACTION_FAILED',
+          message: 'stop dispatch failed',
+        };
+      }
+      return { ok: true, action: req.action, status: 200, data: { running: false } };
+    });
+    isBrowserGone.mockResolvedValue(false);
+    terminateManagedChromeProcessTree.mockImplementation(async () => {
+      isBrowserGone.mockResolvedValue(true);
+      return { killedPids: [4242], portReleased: true };
+    });
+
+    const stopped = await backend.call({ action: 'stop' });
+
+    expect(terminateManagedChromeProcessTree).toHaveBeenCalledWith(expect.objectContaining({
+      cdpHttpUrl: 'http://127.0.0.1:18800',
+      userDataDir: '/managed/browser/Cindy/user-data',
+    }));
+    expect(stopped).toMatchObject({ ok: true, data: { stopped: true } });
+    // The verified teardown must lift the block: the next start goes through.
+    const restarted = await backend.call({ action: 'start' });
+    expect(restarted.ok).toBe(true);
+  });
+
+  it('completes a route switch when the vendored stop fails and the tree teardown reclaims the port', async () => {
+    // stopCurrentRuntime returned on `!stopped.ok` before its own fallback, so
+    // a failed stop during a route switch hard-blocked with the survivor alive.
+    const { backend, created, isBrowserGone } = createHarness();
+    await backend.call({ action: 'start', proxyServer: 'http://proxy-a.test:8080' });
+    const runtime = created[0].runtime;
+    runtime.call.mockImplementation(async (req: BrowserControlRequest): Promise<BrowserControlResult> => {
+      if (req.action === 'stop') {
+        return {
+          ok: false,
+          action: req.action,
+          status: 500,
+          errorCode: 'BROWSER_RUNTIME_ACTION_FAILED',
+          message: 'stop dispatch failed',
+        };
+      }
+      return { ok: true, action: req.action, status: 200, data: { running: false } };
+    });
+    isBrowserGone.mockResolvedValue(false);
+    terminateManagedChromeProcessTree.mockImplementation(async () => {
+      isBrowserGone.mockResolvedValue(true);
+      return { killedPids: [4242], portReleased: true };
+    });
+
+    const switched = await backend.call({ action: 'start' });
+
+    expect(switched.ok).toBe(true);
+    expect(created.map(({ route }) => route.mode)).toEqual(['proxied', 'direct']);
+  });
+
+  it('reclaims the CDP port in start-failure cleanup instead of hard-blocking the route', async () => {
+    // A failing proxied start funnels through stopAndForget; its bare vendored
+    // stop left the just-launched Chrome owning the port and hard-blocked the
+    // route until an explicit verified stop — the tree teardown belongs here
+    // too, so the next start can recover on its own.
+    let killed = false;
+    const proxiedRuntime = {
+      call: vi.fn(async (req: BrowserControlRequest): Promise<BrowserControlResult> => {
+        if (req.action === 'start') return { ok: true, action: req.action, status: 200 };
+        if (req.action === 'stop') {
+          // Cleanup stop cannot prove the exit (Windows orphans survive).
+          return { ok: true, action: req.action, status: 200, data: { stopped: false } };
+        }
+        return { ok: true, action: req.action, status: 200, data: { running: !killed } };
+      }),
+    };
+    const isBrowserGone = vi.fn(async () => killed);
+    const backend = new ExternalChromeBackend(fakeRuntime(), fakeLogger(), {
+      createRuntime: (route) => (route.mode === 'proxied' ? proxiedRuntime : fakeRuntime()),
+      createProxyAuth: () => ({
+        start: async () => { throw new Error('auth setup failed'); },
+        dispose: async () => {},
+      }),
+      isBrowserGone,
+      managedUserDataDir: '/managed/browser/Cindy/user-data',
+    });
+    terminateManagedChromeProcessTree.mockImplementation(async () => {
+      killed = true;
+      return { killedPids: [4242], portReleased: true };
+    });
+
+    const failedStart = await backend.call({
+      action: 'start',
+      proxyServer: 'http://proxy.test:8080',
+    });
+
+    expect(failedStart.ok).toBe(false);
+    expect(terminateManagedChromeProcessTree).toHaveBeenCalledWith(expect.objectContaining({
+      userDataDir: '/managed/browser/Cindy/user-data',
+    }));
+    // No hard block: a later plain start must launch again without needing an
+    // explicit stop first.
+    const restarted = await backend.call({ action: 'start' });
+    expect(restarted.ok).toBe(true);
+  });
+
   it('installs the lifetime guard for credential-free proxied launches too', async () => {
     const auth = { start: vi.fn(async () => {}), dispose: vi.fn(async () => {}) };
     const routes: BrowserProxyRoute[] = [];

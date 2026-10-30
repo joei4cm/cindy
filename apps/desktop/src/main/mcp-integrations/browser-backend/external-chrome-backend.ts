@@ -660,6 +660,22 @@ export class ExternalChromeBackend implements BrowserBackend {
   private async stopBrowser(request: BackendRequest): Promise<BackendResult> {
     const result = await this.runtime.call(this.withoutProxy(request));
     if (!result.ok) {
+      // A failed vendored stop is not proof the browser is gone either: the
+      // stop dispatch can fail in-process while Chrome keeps owning the CDP
+      // port, and returning early here made the tree teardown below
+      // unreachable — the same Windows survivor then hard-blocked every later
+      // request. Attempt the identity-checked teardown before hard-blocking;
+      // only a verified exit may report the stop as done.
+      if (await this.terminateManagedBrowserIfOwned()) {
+        await this.disposeAuth();
+        this.resetStoppedRuntime();
+        return actionWithProxy({
+          ok: true,
+          action: 'stop',
+          status: 200,
+          data: { stopped: true },
+        }, undefined);
+      }
       this.routeBlocked = true;
       return actionWithProxy(result, this.route);
     }
@@ -815,6 +831,19 @@ export class ExternalChromeBackend implements BrowserBackend {
   private async stopCurrentRuntime(): Promise<BackendResult> {
     const stopped = await this.runtime.call({ action: 'stop' });
     if (!stopped.ok) {
+      // Same rescue as stopBrowser: a failed vendored stop can leave the
+      // browser (or its Windows orphans) holding the CDP port, and this early
+      // return used to skip the tree teardown entirely — the route switch then
+      // failed for good with the survivor still alive.
+      if (await this.terminateManagedBrowserIfOwned()) {
+        await this.disposeAuth();
+        return {
+          ok: true,
+          action: 'stop',
+          status: 200,
+          data: { stopped: true },
+        };
+      }
       this.routeBlocked = true;
       this.logger.warn('managed browser route transition stop failed', {
         errorCode: stopped.errorCode,
@@ -866,6 +895,15 @@ export class ExternalChromeBackend implements BrowserBackend {
     } catch (err) {
       stoppedSafely = false;
       this.logger.warn('managed browser cleanup after failed start threw', redactBrowserProxyText(err));
+    }
+    // Start-failure cleanup funnels through here: once the new runtime has
+    // launched Chrome, a failing start (or proxy-guard init) still leaves that
+    // process owning the CDP port, and a bare vendored stop leaves the Windows
+    // orphans in place — the same hard block an unverified explicit stop
+    // produces. Run the identity-checked tree teardown before deciding the
+    // route is unrecoverable.
+    if (!stoppedSafely) {
+      stoppedSafely = await this.terminateManagedBrowserIfOwned();
     }
     if (this.runtime === runtime) {
       if (stoppedSafely) {
