@@ -15211,8 +15211,9 @@ describe('Bot subscription startup admission', () => {
       // A source problem switches at once, without the auto-resume backoff.
       await vi.advanceTimersByTimeAsync(0);
       await flush();
+      // #13712 passes the route-change cause as the 7th argument; a sign-in failure is `auth`.
       expect(h.fallback).toHaveBeenCalledWith(h.sid, 1, expect.any(Number), true, expect.any(Function),
-        expect.objectContaining({ retrySameSource: false, accountUnavailable: true }));
+        expect.objectContaining({ retrySameSource: false, accountUnavailable: true }), 'auth');
       expect(h.session.send).toHaveBeenCalledOnce();
       expect(h.sendToAgent.mock.calls[1][3].persistUserMessage).toMatchObject({ clientId: 'original' });
       expect(h.onRejectedUserTurn).not.toHaveBeenCalled();
