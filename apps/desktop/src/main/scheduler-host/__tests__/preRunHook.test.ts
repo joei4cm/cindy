@@ -12,8 +12,14 @@ import path from 'node:path';
 
 import { describe, expect, it, vi } from 'vitest';
 
-// 透传真实 spawn,只计数:用来断言某些路径根本没有启动真实命令。
+// 透传真实 spawn / execFile,只计数:用来断言某些路径根本没有启动真实命令。
+// execFile 只有 findShellSyntaxError 在用,是「起了几个 sh」的观察口;
+// override 供个别用例注入回调失败(ENOENT 等异步「没查成」形态)。
 const spawnCalls = vi.hoisted(() => ({ count: 0 }));
+const shellCheckCalls = vi.hoisted(() => ({ count: 0 }));
+const execFileOverride = vi.hoisted(() => ({
+  fn: null as null | ((...args: Parameters<typeof import('node:child_process').execFile>) => ReturnType<typeof import('node:child_process').execFile>),
+}));
 vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:child_process')>();
   return {
@@ -22,6 +28,11 @@ vi.mock('node:child_process', async (importOriginal) => {
       spawnCalls.count += 1;
       return actual.spawn(...args);
     }) as typeof actual.spawn,
+    execFile: ((...args: Parameters<typeof actual.execFile>) => {
+      shellCheckCalls.count += 1;
+      if (execFileOverride.fn) return execFileOverride.fn(...args);
+      return actual.execFile(...args);
+    }) as typeof actual.execFile,
   };
 });
 
@@ -276,8 +287,10 @@ describe.skipIf(process.platform === 'win32')('前置检查命令语法预检', 
 
   it('预检耗尽超时预算 → 直接 timed_out,不再启动真实命令', async () => {
     spawnCalls.count = 0;
+    // nonce 保证语法预检真正起 sh(缓存命中会让预检瞬时返回,1ms 预算耗不掉,
+    // 真实命令就会照常启动 —— 那是另一条路径,不是本用例要锁的行为)。
     const result = await executePreRunHook({
-      command: 'node -e "process.exit(0)"',
+      command: `node -e "process.exit(0)" budget-${Date.now()}-${Math.random()}`,
       timeoutMs: 1,
       stdinPayload: payload,
     });
@@ -300,6 +313,90 @@ describe.skipIf(process.platform === 'win32')('前置检查命令语法预检', 
     );
     await expect(assertPreRunHookCommandSyntax(`xdt-node '/a b/x.mjs'`)).resolves.toBeUndefined();
   });
+});
+
+// 降噪:预检不再对同一命令反复起 sh(Main 空转噪音第 3 股)。
+// cindy-node-script 字面脚本路径不经 shell,预检整个跳过;其余命令的有结论
+// 结果(有/无语法错误)进 128 条 LRU,DB 里静态的 command 第二轮起直接命中。
+describe.skipIf(process.platform === 'win32')('语法预检降噪(跳过 + 缓存)', () => {
+  it('cindy-node-script 全程不起 sh:执行走真实脚本进程,退出码协议不变;保存校验同样跳过', async () => {
+    const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'script-hook-noise-'));
+    try {
+      const script = path.join(dir, 'gate.mjs');
+      writeFileSync(script, 'process.exit(2)\n', 'utf8');
+      const command = `cindy-node-script "${script}"`;
+      const baseline = shellCheckCalls.count;
+      const result = await executePreRunHook({ command, stdinPayload: payload });
+      expect(result.decision).toBe('skip');
+      expect(result.exitCode).toBe(2);
+      expect(shellCheckCalls.count).toBe(baseline); // 一个 sh 都没起
+      await expect(assertPreRunHookCommandSyntax(command)).resolves.toBeUndefined();
+      expect(shellCheckCalls.count).toBe(baseline);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('无语法错误的结论进缓存:同一命令第二次执行不再起 sh', async () => {
+    const command = `node -e "process.exit(0)" cache-ok-${Date.now()}-${Math.random()}`;
+    const baseline = shellCheckCalls.count;
+    expect((await executePreRunHook({ command, stdinPayload: payload })).decision).toBe('run');
+    expect(shellCheckCalls.count).toBe(baseline + 1); // 第一次:恰好 1 次 sh -n
+    expect((await executePreRunHook({ command, stdinPayload: payload })).decision).toBe('run');
+    expect(shellCheckCalls.count).toBe(baseline + 1); // 第二次:命中缓存,sh 为 0
+  });
+
+  it('语法错误的结论同样缓存:两次都拦截,sh 只起一次', async () => {
+    const command = `node -e "process.exit(0)" '// cache-err-${Date.now()}-${Math.random()}`;
+    const baseline = shellCheckCalls.count;
+    for (let round = 0; round < 2; round++) {
+      const result = await executePreRunHook({ command, stdinPayload: payload });
+      expect(result.decision).toBe('block');
+      expect(result.error).toMatch(/^shell syntax error in command: /);
+    }
+    expect(shellCheckCalls.count).toBe(baseline + 1);
+  });
+
+  it('没查成的不缓存(NUL 参数同步抛错属无结论):同命令两次预检各自起 sh', async () => {
+    const command = 'node -e "1"\0';
+    const baseline = shellCheckCalls.count;
+    await expect(findShellSyntaxError(command)).resolves.toBeUndefined();
+    await expect(findShellSyntaxError(command)).resolves.toBeUndefined();
+    expect(shellCheckCalls.count).toBe(baseline + 2);
+  });
+
+  it('异步回调失败(ENOENT 形态)同样不缓存:同命令两次预检各自起 sh', async () => {
+    // Greptile P2(13793):「没查成」不只走同步 catch——err.code 为字符串的回调
+    // 失败(ENOENT / 超时被杀 / 取消)也要停在无结论;若被误缓存成「无语法错误」,
+    // 第二次会命中缓存、sh 为 0,这条用例即红。
+    const command = `node -e "process.exit(0)" async-inject-${Date.now()}-${Math.random()}`;
+    const baseline = shellCheckCalls.count;
+    type ExecFile = typeof import('node:child_process').execFile;
+    execFileOverride.fn = ((...args: Parameters<ExecFile>) => {
+      const cb = args[args.length - 1] as (err: Error | null) => void;
+      cb(Object.assign(new Error('spawn /bin/sh ENOENT'), { code: 'ENOENT' }));
+      return undefined as unknown as ReturnType<ExecFile>;
+    }) as ExecFile;
+    try {
+      await expect(findShellSyntaxError(command)).resolves.toBeUndefined();
+      await expect(findShellSyntaxError(command)).resolves.toBeUndefined();
+      expect(shellCheckCalls.count).toBe(baseline + 2); // 两次都真实起 sh:没缓存
+    } finally {
+      execFileOverride.fn = null;
+    }
+  });
+
+  it('缓存有界(128 条 LRU):第 129 条把最旧挤出,再查最旧一条会重新起 sh', async () => {
+    const make = (n: number) => `node -e "process.exit(0)" evict-${Date.now()}-${n}`;
+    const first = make(0);
+    const baseline = shellCheckCalls.count;
+    await expect(findShellSyntaxError(first)).resolves.toBeUndefined();
+    for (let n = 1; n < 129; n++) await expect(findShellSyntaxError(make(n))).resolves.toBeUndefined();
+    expect(shellCheckCalls.count).toBe(baseline + 129);
+    await expect(findShellSyntaxError(first)).resolves.toBeUndefined();
+    expect(shellCheckCalls.count).toBe(baseline + 130); // first 已被挤出:重新起 sh
+  }, 20_000);
 });
 
 describe('resolvePreRunHookTimeoutMs(无默认超时)', () => {

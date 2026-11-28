@@ -10,6 +10,8 @@
  *     fail-closed 阻止本轮并记录失败，避免前置检查异常时绕过闸门。
  *   - POSIX 下执行前先 `sh -n` 预检命令语法:sh 的语法错误退出码恰好也是 2,
  *     不预检会把"引号没配平"之类的命令错误当成正常跳过，任务悄悄停摆。
+ *     `cindy-node-script` 形式不经 shell,跳过预检;其余命令的有结论结果进
+ *     有界 LRU 缓存(DB 里同一任务的 command 是静态的,不每轮重起 sh)。
  *   - 超时**仅在显式配置 timeoutMs 时生效**,未配置 = 不限时(产品决策:
  *     不设默认超时;代价是 hook 卡死会阻塞该轮 fire,由配置方自担)。
  *
@@ -161,15 +163,47 @@ const POSIX_SHELL = '/bin/sh';
 const SYNTAX_CHECK_TIMEOUT_MS = 5_000;
 
 /**
+ * cindy-node-script 形式:字面脚本路径,由独立 Node 运行时直接执行,
+ * 全程不经过任何 shell —— `sh -n` 对它没有意义(预检的只是这段字面前缀本身,
+ * 永远合法),跳过即可少起一个进程。
+ */
+const NODE_SCRIPT_COMMAND = /^cindy-node-script\s+"([^"\r\n]+)"\s*$/;
+
+/**
+ * `sh -n` 预检结果的有界 LRU 缓存(值 null = 已确认无语法错误)。同一任务的
+ * command 在 DB 里是静态的,每轮 fire 都重新起一个 sh 重复验证同一字符串是
+ * 纯空转;缓存只存**有结论**的结果——预检没跑成(超时 / 取消 / spawn 失败 /
+ * 参数非法)不算「无语法错误」,不落缓存,下一轮照常重试。
+ */
+const SYNTAX_CACHE_MAX = 128;
+const shellSyntaxCache = new Map<string, string | null>();
+
+function rememberSyntaxVerdict(command: string, error: string | null): void {
+  // Map 的键序即插入序:get 后重插刷新为最近使用;超限淘汰最旧一条。
+  shellSyntaxCache.delete(command);
+  shellSyntaxCache.set(command, error);
+  if (shellSyntaxCache.size > SYNTAX_CACHE_MAX) {
+    const oldest = shellSyntaxCache.keys().next().value;
+    if (oldest !== undefined) shellSyntaxCache.delete(oldest);
+  }
+}
+
+/**
  * POSIX shell 语法预检(`sh -n -c`,只解析不执行)。返回 shell 的报错文本;语法
  * 正确、Windows(cmd.exe 没有对应能力)或预检本身没能完成(参数非法 / spawn
  * 失败 / 超时 / 取消)时返回 undefined,交给真实执行按原协议处理。
+ * 有结论的结果(有 / 无语法错误)进 LRU 缓存,同命令的下一次预检不再起 sh。
  */
 export function findShellSyntaxError(
   command: string,
   options: { signal?: AbortSignal; timeoutMs?: number } = {},
 ): Promise<string | undefined> {
   if (process.platform === 'win32' || options.signal?.aborted) return Promise.resolve(undefined);
+  const cached = shellSyntaxCache.get(command);
+  if (cached !== undefined) {
+    rememberSyntaxVerdict(command, cached);
+    return Promise.resolve(cached ?? undefined);
+  }
   return new Promise((resolve) => {
     try {
       execFile(
@@ -180,17 +214,25 @@ export function findShellSyntaxError(
           signal: options.signal,
         },
         (err, _stdout, stderr) => {
-          // 只有 shell 正常退出且非 0 才是语法错误;err.code 为字符串(ENOENT /
-          // ABORT_ERR 等)或超时被杀时不下结论。
-          if (!err || typeof err.code !== 'number') {
+          if (!err) {
+            // shell 正常退出 0:确无语法错误,可缓存。
+            rememberSyntaxVerdict(command, null);
             resolve(undefined);
             return;
           }
-          resolve(String(stderr).trim() || `${POSIX_SHELL} -n exited with code ${err.code}`);
+          // err.code 非数字(ENOENT / ABORT_ERR / 超时被杀)是「没查成」,
+          // 不是「没错误」:不下结论、不缓存,交给真实执行按原协议处理。
+          if (typeof err.code !== 'number') {
+            resolve(undefined);
+            return;
+          }
+          const error = String(stderr).trim() || `${POSIX_SHELL} -n exited with code ${err.code}`;
+          rememberSyntaxVerdict(command, error);
+          resolve(error);
         },
       );
     } catch {
-      // 参数非法(如命令含 NUL)时 Node 同步抛错:不下结论,交给真实执行折叠成失败结果。
+      // 参数非法(如命令含 NUL)时 Node 同步抛错:不下结论、不缓存。
       resolve(undefined);
     }
   });
@@ -198,6 +240,8 @@ export function findShellSyntaxError(
 
 /** 保存任务前校验前置检查命令;语法错误抛 invalid,让写错的命令当场被拒。 */
 export async function assertPreRunHookCommandSyntax(command: string): Promise<void> {
+  // 字面脚本路径不经 shell,没有「shell 语法」可错;不白白起一个 sh。
+  if (NODE_SCRIPT_COMMAND.test(command.trim())) return;
   const syntaxError = await findShellSyntaxError(resolveHookCommand(command).command);
   if (syntaxError) {
     throw new Error(
@@ -239,12 +283,14 @@ export async function executePreRunHook(input: PreRunHookInput): Promise<PreRunH
   const resolved = resolveHookCommand(input.command);
   // A literal script path, never a shell expression or Node CLI option. This is separate
   // from legacy xdt-node, whose Electron Node-mode behavior is unsuitable for shipped fuses.
-  const nodeScript = /^cindy-node-script\s+"([^"\r\n]+)"\s*$/.exec(input.command.trim());
-  // 预检与真实执行共用同一个取消信号和超时预算。
-  const syntaxError = await findShellSyntaxError(resolved.command, {
-    signal: input.signal,
-    timeoutMs,
-  });
+  const nodeScript = NODE_SCRIPT_COMMAND.exec(input.command.trim());
+  // 预检与真实执行共用同一个取消信号和超时预算;字面脚本路径不经 shell,直接跳过。
+  const syntaxError = nodeScript
+    ? undefined
+    : await findShellSyntaxError(resolved.command, {
+        signal: input.signal,
+        timeoutMs,
+      });
   if (input.signal?.aborted) return abortedResult();
   const remainingTimeoutMs =
     timeoutMs === undefined ? undefined : timeoutMs - (Date.now() - startedAt);
